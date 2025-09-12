@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
  rm -rf /var/lib/apt/lists/*
 
 # --- Build llama.cpp from latest master with CUDA and install to /usr/local ---
-ARG CUDA_ARCHS="80;86;87,89;90,90a"
+ARG CUDA_ARCHS="80;86;87,89;90"
 RUN git clone https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp && \
     cd /tmp/llama.cpp && \
  export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" && \
