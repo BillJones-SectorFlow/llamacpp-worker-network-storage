@@ -25,11 +25,12 @@ class LlamaCppService:
     """
     Launch llama.cpp (llama-server) and proxy OpenAI-compatible routes.
 
-    Improvements:
+    Behavior:
       - Readiness gating with friendly countdown logs every HEALTH_LOG_INTERVAL_SEC.
       - Optional GPU snapshot lines via `nvidia-smi` while waiting.
       - Incoming requests block until the server is healthy (no premature 503s).
       - Extra stabilization: require consecutive /health 200s and a /v1/models check.
+      - NEW: When LLAMA_DEBUG is truthy, log the full JSON request and JSON response.
     """
 
     def __init__(self) -> None:
@@ -50,6 +51,8 @@ class LlamaCppService:
         self.request_max_wait = self._env_int("OPENAI_MAX_WAIT_SEC", self.ready_timeout)
         # Print GPU snapshots during readiness wait
         self.gpu_snapshot = self._env_bool("GPU_SNAPSHOT", True)
+        # NEW: conditional debug of request/response JSON
+        self.debug = self._env_bool("LLAMA_DEBUG", False)
 
         # Start server and wait until ready
         self.proc: Optional[subprocess.Popen] = None
@@ -86,24 +89,33 @@ class LlamaCppService:
             return await self._proxy_openai("/v1/chat/completions", payload)
         return await self._proxy_openai("/v1/completions", payload)
 
-    # ---------- HTTP proxy with readiness gating ----------
+    # ---------- HTTP proxy with readiness gating & debug logging ----------
     async def _proxy_openai(
         self, path: str, payload: Dict[str, Any]
     ) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
         """
         Do not forward the call until the server is healthy; callers won't see a 503
         during model load. Bounded by OPENAI_MAX_WAIT_SEC.
+        When LLAMA_DEBUG is truthy, log the full JSON request and the JSON response.
         """
         await self._await_ready(self.request_max_wait)
         url = f"{self.base}{path}"
         stream = bool(payload.get("stream", False))
 
+        # --- DEBUG: log outgoing payload ---
+        if self.debug:
+            try:
+                print(f"[llama-debug] -> POST {url}\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+            except Exception:
+                print(f"[llama-debug] -> POST {url} (payload JSON-encode failed)")
+
         if stream:
             async def _gen() -> AsyncGenerator[Dict[str, Any], None]:
                 async with httpx.AsyncClient(timeout=None) as client:
+                    # First attempt
                     async with client.stream("POST", url, json=payload) as resp:
-                        # If for whatever reason server flapped back to 503, block again
                         if resp.status_code == 503:
+                            # Wait again and retry once
                             await self._await_ready(self.request_max_wait)
                             async with client.stream("POST", url, json=payload) as resp2:
                                 resp2.raise_for_status()
@@ -113,12 +125,20 @@ class LlamaCppService:
                                     if line.startswith("data: "):
                                         chunk = line[len("data: "):].strip()
                                         if chunk == "[DONE]":
+                                            # DEBUG: mark end of stream
+                                            if self.debug:
+                                                print("[llama-debug] <- [DONE]")
                                             break
                                         try:
-                                            yield json.loads(chunk)
+                                            obj = json.loads(chunk)
+                                            if self.debug:
+                                                print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+                                            yield obj
                                         except Exception:
+                                            # Non-JSON or parse fail; emit nothing in debug
                                             pass
                             return
+
                         resp.raise_for_status()
                         async for line in resp.aiter_lines():
                             if not line:
@@ -126,20 +146,34 @@ class LlamaCppService:
                             if line.startswith("data: "):
                                 chunk = line[len("data: "):].strip()
                                 if chunk == "[DONE]":
+                                    if self.debug:
+                                        print("[llama-debug] <- [DONE]")
                                     break
                                 try:
-                                    yield json.loads(chunk)
+                                    obj = json.loads(chunk)
+                                    if self.debug:
+                                        print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+                                    yield obj
                                 except Exception:
                                     pass
             return _gen()
 
+        # Non-streaming path
         async with httpx.AsyncClient(timeout=None) as client:
             r = await client.post(url, json=payload)
             if r.status_code == 503:
                 await self._await_ready(self.request_max_wait)
                 r = await client.post(url, json=payload)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+
+            # --- DEBUG: log response JSON ---
+            if self.debug:
+                try:
+                    print(f"[llama-debug] <- {r.status_code} {url}\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+                except Exception:
+                    print(f"[llama-debug] <- {r.status_code} {url} (response JSON-encode failed)")
+            return data
 
     # ---------- llama-server process mgmt ----------
     def _start_llama_server(self) -> None:
@@ -303,7 +337,6 @@ class LlamaCppService:
                     pct = (used / total * 100.0) if total > 0 else 0.0
                     print(f"[gpu] GPU{idx} {name}: util={util_i}% vram={used:.1f}/{total:.1f} GB ({pct:.0f}%)")
                 except Exception:
-                    # if parsing fails, print raw
                     print(f"[gpu] {line}")
         except Exception as e:
             print(f"[gpu] nvidia-smi unavailable or failed: {e}")
@@ -356,7 +389,7 @@ class LlamaCppService:
         val = os.getenv(key, "")
         if not val:
             return default
-        return val.strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
+        return val.strip().lower() in ("1", "true", "yes", "y")
 
     def __del__(self) -> None:
         try:
