@@ -1,31 +1,41 @@
 from __future__ import annotations
 
-import glob
 import json
 import os
 import time
 import subprocess
+import logging
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, Optional, Union, List
 
 import httpx
 
 from model_fetcher import ModelFetcher
 
 
+def _quiet_httpx_logs() -> None:
+    try:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+    except Exception:
+        pass
+
+
 class LlamaCppService:
     """
-    Launches llama.cpp server (llama-server) with CUDA and proxies OpenAI routes.
+    Launch llama.cpp (llama-server) and proxy OpenAI-compatible routes.
 
-    Changes vs. previous version:
-      - Instead of assuming a baked-in model, we fetch GGUF shards from Backblaze B2
-        at runtime (to /runpod-volume/models/<subdir> when available) and point
-        llama-server to the FIRST shard (llama.cpp loads the remaining shards
-        automatically when they are in the same directory).
+    Improvements:
+      - Readiness gating with friendly countdown logs every HEALTH_LOG_INTERVAL_SEC.
+      - Optional GPU snapshot lines via `nvidia-smi` while waiting.
+      - Incoming requests block until the server is healthy (no premature 503s).
+      - Extra stabilization: require consecutive /health 200s and a /v1/models check.
     """
 
     def __init__(self) -> None:
-        # Ensure model exists locally (download if needed)
+        _quiet_httpx_logs()
+
+        # Ensure shards are present locally; choose first shard for -m
         first_shard = self._ensure_model_local_or_fail()
         self.model_path = str(first_shard)
 
@@ -33,13 +43,19 @@ class LlamaCppService:
         self.port = int(os.getenv("LLAMA_SERVER_PORT", "8080"))
         self.base = f"http://{self.host}:{self.port}"
 
+        # Timeouts / retries / logging cadence
+        self.ready_timeout = self._env_int("LLAMA_READY_TIMEOUT_SEC", 1800)
+        self.health_log_interval = self._env_int("HEALTH_LOG_INTERVAL_SEC", 10)
+        # How long request handlers will wait for readiness before failing
+        self.request_max_wait = self._env_int("OPENAI_MAX_WAIT_SEC", self.ready_timeout)
+        # Print GPU snapshots during readiness wait
+        self.gpu_snapshot = self._env_bool("GPU_SNAPSHOT", True)
+
+        # Start server and wait until ready
         self.proc: Optional[subprocess.Popen] = None
         self._start_llama_server()
 
-        try:
-            self.max_concurrency = int(os.getenv("RUNPOD_MAX_CONCURRENCY", "1"))
-        except Exception:
-            self.max_concurrency = 1
+        self.max_concurrency = self._env_int("RUNPOD_MAX_CONCURRENCY", 1)
 
     # ---------- OpenAI-compatible entry points ----------
     async def handle_openai_route(
@@ -51,9 +67,7 @@ class LlamaCppService:
         if route.endswith("/v1/models"):
             return {
                 "object": "list",
-                "data": [
-                    {"id": Path(self.model_path).name, "object": "model"}
-                ],
+                "data": [{"id": Path(self.model_path).name, "object": "model"}],
             }
 
         if route.endswith("/v1/chat/completions"):
@@ -72,10 +86,15 @@ class LlamaCppService:
             return await self._proxy_openai("/v1/chat/completions", payload)
         return await self._proxy_openai("/v1/completions", payload)
 
-    # ---------- HTTP proxy ----------
+    # ---------- HTTP proxy with readiness gating ----------
     async def _proxy_openai(
         self, path: str, payload: Dict[str, Any]
     ) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
+        """
+        Do not forward the call until the server is healthy; callers won't see a 503
+        during model load. Bounded by OPENAI_MAX_WAIT_SEC.
+        """
+        await self._await_ready(self.request_max_wait)
         url = f"{self.base}{path}"
         stream = bool(payload.get("stream", False))
 
@@ -83,6 +102,23 @@ class LlamaCppService:
             async def _gen() -> AsyncGenerator[Dict[str, Any], None]:
                 async with httpx.AsyncClient(timeout=None) as client:
                     async with client.stream("POST", url, json=payload) as resp:
+                        # If for whatever reason server flapped back to 503, block again
+                        if resp.status_code == 503:
+                            await self._await_ready(self.request_max_wait)
+                            async with client.stream("POST", url, json=payload) as resp2:
+                                resp2.raise_for_status()
+                                async for line in resp2.aiter_lines():
+                                    if not line:
+                                        continue
+                                    if line.startswith("data: "):
+                                        chunk = line[len("data: "):].strip()
+                                        if chunk == "[DONE]":
+                                            break
+                                        try:
+                                            yield json.loads(chunk)
+                                        except Exception:
+                                            pass
+                            return
                         resp.raise_for_status()
                         async for line in resp.aiter_lines():
                             if not line:
@@ -99,6 +135,9 @@ class LlamaCppService:
 
         async with httpx.AsyncClient(timeout=None) as client:
             r = await client.post(url, json=payload)
+            if r.status_code == 503:
+                await self._await_ready(self.request_max_wait)
+                r = await client.post(url, json=payload)
             r.raise_for_status()
             return r.json()
 
@@ -130,6 +169,10 @@ class LlamaCppService:
         if n_ctx:
             args += ["--ctx-size", str(n_ctx)]
 
+        n_par = os.getenv("LLAMA_ARG_N_PARALLEL")
+        if n_par:
+            args += ["--parallel", str(n_par)]
+
         if os.getenv("LLAMA_NO_WEBUI", "1") != "0":
             args += ["--no-webui"]
 
@@ -141,50 +184,132 @@ class LlamaCppService:
             bufsize=1,
             universal_newlines=True,
         )
-        self._wait_until_ready()
 
-    def _wait_until_ready(self, timeout: float = 120.0) -> None:
-        """Wait only on /health, then log a one-time health snippet."""
+        # Wait for health to be truly ready with friendly countdown logging
+        self._wait_until_ready(self.ready_timeout)
+
+    def _wait_until_ready(self, timeout: int) -> None:
         start = time.time()
-        url_health = f"{self.base}/health"
+        next_log = 0.0
+        consecutive_ok = 0
+        required_ok = 3  # reduce 200->503 flapping
 
-        while time.time() - start < timeout:
-            try:
-                r = httpx.get(url_health, timeout=3.0)
-                if r.status_code == 200:
-                    self._log_health_once()
-                    return
-            except Exception:
-                pass
-            time.sleep(0.8)
+        while True:
+            elapsed = time.time() - start
+            remaining = int(max(0, timeout - elapsed))
 
-        # surface output if startup failed
+            # Periodic friendly log
+            if elapsed >= next_log:
+                print(f"[startup] Waiting {remaining}s for {self.base}/health to become available...")
+                if self.gpu_snapshot:
+                    self._log_gpu_snapshot()
+                next_log = elapsed + self.health_log_interval
+
+            # Health probe (once per second)
+            ok = self._health_ok()
+            if ok:
+                consecutive_ok += 1
+                if consecutive_ok >= required_ok:
+                    # extra check: /v1/models should succeed
+                    if self._models_ok():
+                        # final info line (once)
+                        self._log_health_once()
+                        return
+            else:
+                consecutive_ok = 0
+
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"llama-server failed to become ready within {timeout}s "
+                    f"(last health status was not stable 200)."
+                )
+
+            time.sleep(1.0)
+
+    def _health_ok(self) -> bool:
         try:
-            if self.proc and self.proc.stdout:
-                lines = []
-                for _ in range(200):
-                    line = self.proc.stdout.readline()
-                    if not line:
-                        break
-                    lines.append(line.rstrip())
-                raise RuntimeError("llama-server failed to become ready.\n" + "\n".join(lines))
-        except Exception as e:
-            raise e
+            with httpx.Client(timeout=5.0) as client:
+                r = client.get(f"{self.base}/health")
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    def _models_ok(self) -> bool:
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                r = client.get(f"{self.base}/v1/models")
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    async def _await_ready(self, max_wait: int) -> None:
+        """
+        Async variant used in request path. Blocks caller until healthy or timeout.
+        """
+        start = time.time()
+        last_log = -999
+        while True:
+            if self._health_ok():
+                # double check models endpoint once
+                if self._models_ok():
+                    return
+            waited = int(time.time() - start)
+            if waited >= max_wait:
+                raise RuntimeError("Model is still loading (timed out waiting for readiness).")
+            # print a soft notice approximately every 10s to avoid chatty logs
+            if self.health_log_interval > 0 and waited // self.health_log_interval != last_log:
+                remaining = int(max_wait - waited)
+                print(f"[request] Waiting {remaining}s for {self.base}/health to become available...")
+                last_log = waited // self.health_log_interval
+            await self._asleep(1.0)
+
+    @staticmethod
+    async def _asleep(sec: float) -> None:
+        import asyncio
+        await asyncio.sleep(sec)
 
     def _log_health_once(self) -> None:
         try:
             r = httpx.get(f"{self.base}/health", timeout=5.0)
             txt = (r.text or "").strip()
-            print(f"[llama-server] /health {r.status_code}: {txt[:500]}")
+            print(f"[llama-server] READY /health {r.status_code}: {txt[:500]}")
         except Exception as e:
             print(f"[llama-server] /health log failed: {e}")
 
+    # ---------- GPU snapshot logging ----------
+    def _log_gpu_snapshot(self) -> None:
+        """
+        Emit a one-line summary per GPU: index, name, util%, mem used/total (and %).
+        Uses `nvidia-smi --query-gpu=... --format=csv,noheader,nounits`.
+        """
+        try:
+            cmd = [
+                "nvidia-smi",
+                "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ]
+            out = subprocess.check_output(" ".join(cmd), shell=True, text=True, stderr=subprocess.STDOUT)
+            lines = [l.strip() for l in out.splitlines() if l.strip()]
+            for line in lines:
+                # Example (nounits): "0, NVIDIA A100-SXM4-80GB, 12, 4235, 81251"
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 5:
+                    continue
+                idx, name, util, mem_used_mb, mem_total_mb = parts
+                try:
+                    util_i = int(util)
+                    used = float(mem_used_mb) / 1024.0
+                    total = float(mem_total_mb) / 1024.0
+                    pct = (used / total * 100.0) if total > 0 else 0.0
+                    print(f"[gpu] GPU{idx} {name}: util={util_i}% vram={used:.1f}/{total:.1f} GB ({pct:.0f}%)")
+                except Exception:
+                    # if parsing fails, print raw
+                    print(f"[gpu] {line}")
+        except Exception as e:
+            print(f"[gpu] nvidia-smi unavailable or failed: {e}")
+
     # ---------- model discovery / fetching ----------
     def _ensure_model_local_or_fail(self) -> Path:
-        """
-        Prefer explicitly provided local path (MODEL_LOCAL_PATH). Otherwise fetch from B2.
-        Return the path to the FIRST shard to pass to -m.
-        """
         explicit = (os.getenv("MODEL_LOCAL_PATH") or "").strip()
         if explicit:
             p = Path(explicit)
@@ -202,10 +327,7 @@ class LlamaCppService:
     def _with_default_params(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(payload or {})
         if data.get("max_tokens") is None:
-            try:
-                default_max = int(os.getenv("DEFAULT_MAX_TOKENS", "32768"))
-            except Exception:
-                default_max = 32768
+            default_max = self._env_int("DEFAULT_MAX_TOKENS", 32768)
             data["max_tokens"] = max(1, default_max)
 
         # Normalize OpenAI "content parts" to plain text
@@ -221,6 +343,20 @@ class LlamaCppService:
                                 texts.append(t)
                     m["content"] = "\n".join(texts)
         return data
+
+    @staticmethod
+    def _env_int(key: str, default: int) -> int:
+        try:
+            return int(os.getenv(key, str(default)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _env_bool(key: str, default: bool) -> bool:
+        val = os.getenv(key, "")
+        if not val:
+            return default
+        return val.strip() not in ("0", "false", "False", "FALSE", "no", "No", "NO")
 
     def __del__(self) -> None:
         try:
