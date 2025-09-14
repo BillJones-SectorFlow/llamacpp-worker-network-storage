@@ -24,7 +24,7 @@ RUN git clone https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp && \
       -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS} \
       -DCMAKE_INSTALL_PREFIX=/usr/local \
       . && \
- cmake --build build -j $(nproc) && \
+ cmake --build build -j 64 && \
  cmake --install build && \
  echo "/usr/local/lib" > /etc/ld.so.conf.d/llama.conf && ldconfig && \
  rm -rf /tmp/llama.cpp
