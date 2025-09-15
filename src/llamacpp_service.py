@@ -31,7 +31,7 @@ class LlamaCppService:
       - Incoming requests block until the server is healthy (no premature 503s).
       - Extra stabilization: require consecutive /health 200s and a /v1/models check.
       - When LLAMA_DEBUG is truthy, log the full JSON request and JSON response.
-      - FIX: Stream yields SSE strings ("data: {...}\\n\\n") required by RunPod OpenAI gateway.
+      - FAST STREAMING: zero-copy SSE pass-through (no JSON parse/encode per chunk).
     """
 
     def __init__(self) -> None:
@@ -93,7 +93,7 @@ class LlamaCppService:
     # ---------- HTTP proxy with readiness gating & debug logging ----------
     async def _proxy_openai(
         self, path: str, payload: Dict[str, Any]
-    ) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
+    ) -> Union[Dict[str, Any], AsyncGenerator[Union[str, Dict[str, Any]], None]]:
         """
         Do not forward the call until the server is healthy; callers won't see a 503
         during model load. Bounded by OPENAI_MAX_WAIT_SEC.
@@ -112,51 +112,42 @@ class LlamaCppService:
 
         if stream:
             async def _gen() -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
+                headers = {"Accept": "text/event-stream"}
                 async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream("POST", url, json=payload) as resp:
+                    # first attempt
+                    async with client.stream("POST", url, json=payload, headers=headers) as resp:
                         if resp.status_code == 503:
-                            # Wait again and retry once
+                            # wait again and retry once
                             await self._await_ready(self.request_max_wait)
-                            async with client.stream("POST", url, json=payload) as resp2:
+                            async with client.stream("POST", url, json=payload, headers=headers) as resp2:
                                 resp2.raise_for_status()
                                 async for line in resp2.aiter_lines():
                                     if not line or not line.startswith("data: "):
                                         continue
-                                    chunk = line[len("data: "):].strip()
-                                    if chunk == "[DONE]":
+                                    # pass-through exactly as SSE; aiter_lines strips newlines -> add \n\n
+                                    if line == "data: [DONE]":
                                         if self.debug:
                                             print("[llama-debug] <- [DONE]")
-                                        # IMPORTANT: RunPod OpenAI gateway expects SSE lines
                                         yield "data: [DONE]\n\n"
                                         break
-                                    try:
-                                        obj = json.loads(chunk)
-                                    except Exception:
-                                        continue
                                     if self.debug:
-                                        print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
-                                    # Yield SSE string, not a dict
-                                    yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
+                                        # try to show the JSON chunk, but don't parse for speed
+                                        print(f"[llama-debug] <- chunk {line[6:][:200]}...")
+                                    yield line + "\n\n"
                             return
 
                         resp.raise_for_status()
                         async for line in resp.aiter_lines():
                             if not line or not line.startswith("data: "):
                                 continue
-                            chunk = line[len("data: "):].strip()
-                            if chunk == "[DONE]":
+                            if line == "data: [DONE]":
                                 if self.debug:
                                     print("[llama-debug] <- [DONE]")
                                 yield "data: [DONE]\n\n"
                                 break
-                            try:
-                                obj = json.loads(chunk)
-                            except Exception:
-                                continue
                             if self.debug:
-                                print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
-                            # Yield SSE string, not a dict
-                            yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
+                                print(f"[llama-debug] <- chunk {line[6:][:200]}...")
+                            yield line + "\n\n"
             return _gen()
 
         # Non-streaming path
