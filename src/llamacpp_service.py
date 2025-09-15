@@ -1,54 +1,64 @@
 from __future__ import annotations
 
-import glob
 import json
 import os
 import time
 import subprocess
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+import logging
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, Optional, Union, List
 
 import httpx
 
+from model_fetcher import ModelFetcher
 
-def _env_truthy(name: str, default: str = "0") -> bool:
-    v = os.getenv(name, default)
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _quiet_httpx_logs() -> None:
+    try:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+    except Exception:
+        pass
 
 
 class LlamaCppService:
     """
-    Launches the native llama.cpp server (llama-server) with CUDA and proxies
-    OpenAI-compatible routes to it.
+    Launch llama.cpp (llama-server) and proxy OpenAI-compatible routes.
 
-    Key points:
-      - Uses baked model if present under BASE_PATH (same pattern as RunPod worker-vllm).
-      - Defaults max_tokens to 32768.
-      - GPU offload via env passthrough: LLAMA_ARG_N_GPU_LAYERS, LLAMA_ARG_TENSOR_SPLIT, etc.
-      - Logs a one-time /health payload when ready (no /v1/models check).
+    Behavior:
+      - Readiness gating with friendly countdown logs every HEALTH_LOG_INTERVAL_SEC.
+      - Optional GPU snapshot lines via `nvidia-smi` while waiting.
+      - Incoming requests block until the server is healthy (no premature 503s).
+      - Extra stabilization: require consecutive /health 200s and a /v1/models check.
+      - When LLAMA_DEBUG is truthy, log the full JSON request and JSON response.
     """
 
     def __init__(self) -> None:
-        # model path resolution may have been replaced by your B2/network-volume fetcher;
-        # retain existing behavior if still present in your codebase.
-        self.model_path = self._locate_baked_model_or_fail()
+        _quiet_httpx_logs()
+
+        # Ensure shards are present locally; choose first shard for -m
+        first_shard = self._ensure_model_local_or_fail()
+        self.model_path = str(first_shard)
+
         self.host = os.getenv("LLAMA_SERVER_HOST", "127.0.0.1")
         self.port = int(os.getenv("LLAMA_SERVER_PORT", "8080"))
         self.base = f"http://{self.host}:{self.port}"
 
+        # Timeouts / retries / logging cadence
+        self.ready_timeout = self._env_int("LLAMA_READY_TIMEOUT_SEC", 1800)
+        self.health_log_interval = self._env_int("HEALTH_LOG_INTERVAL_SEC", 10)
+        # How long request handlers will wait for readiness before failing
+        self.request_max_wait = self._env_int("OPENAI_MAX_WAIT_SEC", self.ready_timeout)
+        # Print GPU snapshots during readiness wait
+        self.gpu_snapshot = self._env_bool("GPU_SNAPSHOT", True)
+        # conditional debug of request/response JSON
+        self.debug = self._env_bool("LLAMA_DEBUG", False)
+
+        # Start server and wait until ready
         self.proc: Optional[subprocess.Popen] = None
         self._start_llama_server()
 
-        # stream formatting for RunPod:
-        # - "text" (default): yield {"output": "<token>"} per chunk (best for RunPod SDKs /stream)
-        # - "raw" : yield the original OpenAI chunk objects
-        self.stream_format = os.getenv("LLAMA_STREAM_FORMAT", "text").strip().lower()
-        if self.stream_format not in {"text", "raw"}:
-            self.stream_format = "text"
-
-        try:
-            self.max_concurrency = int(os.getenv("RUNPOD_MAX_CONCURRENCY", "1"))
-        except Exception:
-            self.max_concurrency = 1
+        self.max_concurrency = self._env_int("RUNPOD_MAX_CONCURRENCY", 1)
 
     # ---------- OpenAI-compatible entry points ----------
     async def handle_openai_route(
@@ -58,8 +68,10 @@ class LlamaCppService:
         data = self._with_default_params(route_input or {})
 
         if route.endswith("/v1/models"):
-            return {"object": "list",
-                    "data": [{"id": os.path.basename(self.model_path), "object": "model"}]}
+            return {
+                "object": "list",
+                "data": [{"id": Path(self.model_path).name, "object": "model"}],
+            }
 
         if route.endswith("/v1/chat/completions"):
             return await self._proxy_openai("/v1/chat/completions", data)
@@ -77,106 +89,93 @@ class LlamaCppService:
             return await self._proxy_openai("/v1/chat/completions", payload)
         return await self._proxy_openai("/v1/completions", payload)
 
-    # ---------- HTTP proxy ----------
+    # ---------- HTTP proxy with readiness gating & debug logging ----------
     async def _proxy_openai(
         self, path: str, payload: Dict[str, Any]
     ) -> Union[Dict[str, Any], AsyncGenerator[Dict[str, Any], None]]:
+        """
+        Do not forward the call until the server is healthy; callers won't see a 503
+        during model load. Bounded by OPENAI_MAX_WAIT_SEC.
+        When LLAMA_DEBUG is truthy, log the full JSON request and the JSON response.
+        """
+        await self._await_ready(self.request_max_wait)
         url = f"{self.base}{path}"
         stream = bool(payload.get("stream", False))
-        debug = _env_truthy("LLAMA_DEBUG", "0")
+
+        # --- DEBUG: log outgoing payload ---
+        if self.debug:
+            try:
+                print(f"[llama-debug] -> POST {url}\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+            except Exception:
+                print(f"[llama-debug] -> POST {url} (payload JSON-encode failed)")
 
         if stream:
-            if debug:
-                try:
-                    print("[llama-debug] -> POST", url, flush=True)
-                    print(json.dumps(payload, indent=2, ensure_ascii=False), flush=True)
-                except Exception:
-                    pass
-
             async def _gen() -> AsyncGenerator[Dict[str, Any], None]:
-                # stream SSE from llama-server, translate to RunPod-friendly yields
                 async with httpx.AsyncClient(timeout=None) as client:
+                    # First attempt
                     async with client.stream("POST", url, json=payload) as resp:
+                        if resp.status_code == 503:
+                            # Wait again and retry once
+                            await self._await_ready(self.request_max_wait)
+                            async with client.stream("POST", url, json=payload) as resp2:
+                                resp2.raise_for_status()
+                                async for line in resp2.aiter_lines():
+                                    if not line:
+                                        continue
+                                    if line.startswith("data: "):
+                                        chunk = line[len("data: "):].strip()
+                                        if chunk == "[DONE]":
+                                            # DEBUG: mark end of stream
+                                            if self.debug:
+                                                print("[llama-debug] <- [DONE]")
+                                            break
+                                        try:
+                                            obj = json.loads(chunk)
+                                            if self.debug:
+                                                print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+                                            # NOTE: streaming yields raw OpenAI chunks (unchanged behavior)
+                                            yield obj
+                                        except Exception:
+                                            # Non-JSON or parse fail; emit nothing in debug
+                                            pass
+                            return
+
                         resp.raise_for_status()
                         async for line in resp.aiter_lines():
                             if not line:
                                 continue
-                            if not line.startswith("data: "):
-                                continue
-                            chunk = line[len("data: "):].strip()
-                            if chunk == "[DONE]":
-                                if debug:
-                                    print("[llama-debug] <- [DONE]", flush=True)
-                                break
-                            try:
-                                obj = json.loads(chunk)
-                            except Exception:
-                                continue
-
-                            # Optional debug of raw chunk
-                            if debug:
+                            if line.startswith("data: "):
+                                chunk = line[len("data: "):].strip()
+                                if chunk == "[DONE]":
+                                    if self.debug:
+                                        print("[llama-debug] <- [DONE]")
+                                    break
                                 try:
-                                    print("[llama-debug] <- chunk", flush=True)
-                                    print(json.dumps(obj, indent=2, ensure_ascii=False), flush=True)
+                                    obj = json.loads(chunk)
+                                    if self.debug:
+                                        print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+                                    # NOTE: streaming yields raw OpenAI chunks (unchanged behavior)
+                                    yield obj
                                 except Exception:
                                     pass
-
-                            if self.stream_format == "raw":
-                                # Yield the original llama-server/OpenAI chunk object
-                                yield obj
-                                continue
-
-                            # Default: extract text piece and yield {"output": "<token>"}
-                            text_piece = self._extract_text_piece(obj)
-                            if text_piece:
-                                yield {"output": text_piece}
-
-                # generator ends → RunPod marks stream complete
-
             return _gen()
 
-        # Non-streaming: one-shot POST, return JSON as-is
+        # Non-streaming path
         async with httpx.AsyncClient(timeout=None) as client:
-            if debug:
-                try:
-                    print("[llama-debug] -> POST", url, flush=True)
-                    print(json.dumps(payload, indent=2, ensure_ascii=False), flush=True)
-                except Exception:
-                    pass
             r = await client.post(url, json=payload)
+            if r.status_code == 503:
+                await self._await_ready(self.request_max_wait)
+                r = await client.post(url, json=payload)
             r.raise_for_status()
-            out = r.json()
-            if debug:
-                try:
-                    print("[llama-debug] <- response", flush=True)
-                    print(json.dumps(out, indent=2, ensure_ascii=False), flush=True)
-                except Exception:
-                    pass
-            return out
+            data = r.json()
 
-    @staticmethod
-    def _extract_text_piece(chunk: Dict[str, Any]) -> str:
-        """
-        Pull token text from either chat (`choices[0].delta.content`) or
-        legacy completions (`choices[0].text`). Return empty string if none.
-        """
-        try:
-            choices = chunk.get("choices") or []
-            if not choices:
-                return ""
-            c0 = choices[0] or {}
-            delta = c0.get("delta") or {}
-            if isinstance(delta, dict):
-                txt = delta.get("content")
-                if isinstance(txt, str):
-                    return txt
-            # fallback: text field (completions)
-            txt2 = c0.get("text")
-            if isinstance(txt2, str):
-                return txt2
-        except Exception:
-            pass
-        return ""
+            # --- DEBUG: log response JSON ---
+            if self.debug:
+                try:
+                    print(f"[llama-debug] <- {r.status_code} {url}\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+                except Exception:
+                    print(f"[llama-debug] <- {r.status_code} {url} (response JSON-encode failed)")
+            return data
 
     # ---------- llama-server process mgmt ----------
     def _start_llama_server(self) -> None:
@@ -206,6 +205,10 @@ class LlamaCppService:
         if n_ctx:
             args += ["--ctx-size", str(n_ctx)]
 
+        n_par = os.getenv("LLAMA_ARG_N_PARALLEL")
+        if n_par:
+            args += ["--parallel", str(n_par)]
+
         if os.getenv("LLAMA_NO_WEBUI", "1") != "0":
             args += ["--no-webui"]
 
@@ -217,94 +220,149 @@ class LlamaCppService:
             bufsize=1,
             universal_newlines=True,
         )
-        self._wait_until_ready()
 
-    def _wait_until_ready(self, timeout: float = 120.0) -> None:
-        """Wait only on /health, then log a one-time health snippet."""
+        # Wait for health to be truly ready with friendly countdown logging
+        self._wait_until_ready(self.ready_timeout)
+
+    def _wait_until_ready(self, timeout: int) -> None:
         start = time.time()
-        url_health = f"{self.base}/health"
+        next_log = 0.0
+        consecutive_ok = 0
+        required_ok = 3  # reduce 200->503 flapping
 
-        while time.time() - start < timeout:
-            try:
-                r = httpx.get(url_health, timeout=3.0)
-                if r.status_code == 200:
-                    # one-time health log snippet
-                    self._log_health_once()
-                    return
-            except Exception:
-                pass
-            time.sleep(0.8)
+        while True:
+            elapsed = time.time() - start
+            remaining = int(max(0, timeout - elapsed))
 
-        # surface last lines of output if startup failed
+            # Periodic friendly log
+            if elapsed >= next_log:
+                print(f"[startup] Waiting {remaining}s for {self.base}/health to become available...")
+                if self.gpu_snapshot:
+                    self._log_gpu_snapshot()
+                next_log = elapsed + self.health_log_interval
+
+            # Health probe (once per second)
+            ok = self._health_ok()
+            if ok:
+                consecutive_ok += 1
+                if consecutive_ok >= required_ok:
+                    # extra check: /v1/models should succeed
+                    if self._models_ok():
+                        # final info line (once)
+                        self._log_health_once()
+                        return
+            else:
+                consecutive_ok = 0
+
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"llama-server failed to become ready within {timeout}s "
+                    f"(last health status was not stable 200)."
+                )
+
+            time.sleep(1.0)
+
+    def _health_ok(self) -> bool:
         try:
-            if self.proc and self.proc.stdout:
-                lines = []
-                for _ in range(120):
-                    line = self.proc.stdout.readline()
-                    if not line:
-                        break
-                    lines.append(line.rstrip())
-                raise RuntimeError("llama-server failed to become ready.\n" + "\n".join(lines))
-        except Exception as e:
-            raise e
+            with httpx.Client(timeout=5.0) as client:
+                r = client.get(f"{self.base}/health")
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    def _models_ok(self) -> bool:
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                r = client.get(f"{self.base}/v1/models")
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    async def _await_ready(self, max_wait: int) -> None:
+        """
+        Async variant used in request path. Blocks caller until healthy or timeout.
+        """
+        start = time.time()
+        last_log = -999
+        while True:
+            if self._health_ok():
+                # double check models endpoint once
+                if self._models_ok():
+                    return
+            waited = int(time.time() - start)
+            if waited >= max_wait:
+                raise RuntimeError("Model is still loading (timed out waiting for readiness).")
+            # print a soft notice approximately every 10s to avoid chatty logs
+            if self.health_log_interval > 0 and waited // self.health_log_interval != last_log:
+                remaining = int(max_wait - waited)
+                print(f"[request] Waiting {remaining}s for {self.base}/health to become available...")
+                last_log = waited // self.health_log_interval
+            await self._asleep(1.0)
+
+    @staticmethod
+    async def _asleep(sec: float) -> None:
+        import asyncio
+        await asyncio.sleep(sec)
 
     def _log_health_once(self) -> None:
-        """Print a short /health payload to stdout for easier diagnostics."""
         try:
             r = httpx.get(f"{self.base}/health", timeout=5.0)
             txt = (r.text or "").strip()
-            # keep it concise in logs
-            print(f"[llama-server] /health {r.status_code}: {txt[:500]}")
+            print(f"[llama-server] READY /health {r.status_code}: {txt[:500]}")
         except Exception as e:
             print(f"[llama-server] /health log failed: {e}")
 
-    # ---------- model discovery ----------
-    def _locate_baked_model_or_fail(self) -> str:
+    # ---------- GPU snapshot logging ----------
+    def _log_gpu_snapshot(self) -> None:
         """
-        Prefer GGUF files baked into the image under BASE_PATH.
-        If MODEL_VARIANT is set, prefer files whose path includes that variant.
-        Pick the largest .gguf.
+        Emit a one-line summary per GPU: index, name, util%, mem used/total (and %).
+        Uses `nvidia-smi --query-gpu=... --format=csv,noheader,nounits`.
         """
-        base = (os.getenv("BASE_PATH") or "/models").rstrip("/")
-        variant = (os.getenv("MODEL_VARIANT") or "").strip()
+        try:
+            cmd = [
+                "nvidia-smi",
+                "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ]
+            out = subprocess.check_output(" ".join(cmd), shell=True, text=True, stderr=subprocess.STDOUT)
+            lines = [l.strip() for l in out.splitlines() if l.strip()]
+            for line in lines:
+                # Example (nounits): "0, NVIDIA A100-SXM4-80GB, 12, 4235, 81251"
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) != 5:
+                    continue
+                idx, name, util, mem_used_mb, mem_total_mb = parts
+                try:
+                    util_i = int(util)
+                    used = float(mem_used_mb) / 1024.0
+                    total = float(mem_total_mb) / 1024.0
+                    pct = (used / total * 100.0) if total > 0 else 0.0
+                    print(f"[gpu] GPU{idx} {name}: util={util_i}% vram={used:.1f}/{total:.1f} GB ({pct:.0f}%)")
+                except Exception:
+                    print(f"[gpu] {line}")
+        except Exception as e:
+            print(f"[gpu] nvidia-smi unavailable or failed: {e}")
 
-        candidates = self._find_all_gguf(base)
-        if not candidates:
-            raise RuntimeError(
-                f"No .gguf files found under BASE_PATH={base}. "
-                f"Make sure the image was built with the model baked in."
-            )
+    # ---------- model discovery / fetching ----------
+    def _ensure_model_local_or_fail(self) -> Path:
+        explicit = (os.getenv("MODEL_LOCAL_PATH") or "").strip()
+        if explicit:
+            p = Path(explicit)
+            if not p.exists():
+                raise RuntimeError(f"MODEL_LOCAL_PATH does not exist: {explicit}")
+            return p
 
-        if variant:
-            v = [p for p in candidates if f"/{variant}/" in p or p.endswith(f"/{variant}.gguf")]
-            if v:
-                candidates = v
-
-        candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
-        return candidates[0]
-
-    @staticmethod
-    def _find_all_gguf(root: str) -> List[str]:
-        pats = [os.path.join(root, "**", "*.gguf"), os.path.join(root, "*.gguf")]
-        out: List[str] = []
-        for p in pats:
-            out.extend(glob.glob(p, recursive=True))
-        seen: set[str] = set()
-        uniq: List[str] = []
-        for f in out:
-            if os.path.isfile(f) and f not in seen:
-                uniq.append(f)
-                seen.add(f)
-        return uniq
+        fetcher = ModelFetcher()
+        first = fetcher.ensure_local()
+        if not first.exists():
+            raise RuntimeError(f"Downloaded model shard not found: {first}")
+        return first
 
     # ---------- defaults mapper ----------
     def _with_default_params(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(payload or {})
         if data.get("max_tokens") is None:
-            try:
-                default_max = int(os.getenv("DEFAULT_MAX_TOKENS", "32768"))
-            except Exception:
-                default_max = 32768
+            default_max = self._env_int("DEFAULT_MAX_TOKENS", 32768)
             data["max_tokens"] = max(1, default_max)
 
         # Normalize OpenAI "content parts" to plain text
@@ -320,6 +378,20 @@ class LlamaCppService:
                                 texts.append(t)
                     m["content"] = "\n".join(texts)
         return data
+
+    @staticmethod
+    def _env_int(key: str, default: int) -> int:
+        try:
+            return int(os.getenv(key, str(default)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _env_bool(key: str, default: bool) -> bool:
+        val = os.getenv(key, "")
+        if not val:
+            return default
+        return val.strip().lower() in ("1", "true", "yes", "y")
 
     def __del__(self) -> None:
         try:
