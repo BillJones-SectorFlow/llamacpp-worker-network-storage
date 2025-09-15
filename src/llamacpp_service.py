@@ -6,7 +6,7 @@ import time
 import subprocess
 import logging
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional, Union, List
+from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 import httpx
 
@@ -31,6 +31,7 @@ class LlamaCppService:
       - Incoming requests block until the server is healthy (no premature 503s).
       - Extra stabilization: require consecutive /health 200s and a /v1/models check.
       - When LLAMA_DEBUG is truthy, log the full JSON request and JSON response.
+      - FIX: Stream yields SSE strings ("data: {...}\\n\\n") required by RunPod OpenAI gateway.
     """
 
     def __init__(self) -> None:
@@ -110,9 +111,8 @@ class LlamaCppService:
                 print(f"[llama-debug] -> POST {url} (payload JSON-encode failed)")
 
         if stream:
-            async def _gen() -> AsyncGenerator[Dict[str, Any], None]:
+            async def _gen() -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
                 async with httpx.AsyncClient(timeout=None) as client:
-                    # First attempt
                     async with client.stream("POST", url, json=payload) as resp:
                         if resp.status_code == 503:
                             # Wait again and retry once
@@ -120,44 +120,43 @@ class LlamaCppService:
                             async with client.stream("POST", url, json=payload) as resp2:
                                 resp2.raise_for_status()
                                 async for line in resp2.aiter_lines():
-                                    if not line:
+                                    if not line or not line.startswith("data: "):
                                         continue
-                                    if line.startswith("data: "):
-                                        chunk = line[len("data: "):].strip()
-                                        if chunk == "[DONE]":
-                                            # DEBUG: mark end of stream
-                                            if self.debug:
-                                                print("[llama-debug] <- [DONE]")
-                                            break
-                                        try:
-                                            obj = json.loads(chunk)
-                                            if self.debug:
-                                                print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
-                                            # NOTE: streaming yields raw OpenAI chunks (unchanged behavior)
-                                            yield obj
-                                        except Exception:
-                                            # Non-JSON or parse fail; emit nothing in debug
-                                            pass
+                                    chunk = line[len("data: "):].strip()
+                                    if chunk == "[DONE]":
+                                        if self.debug:
+                                            print("[llama-debug] <- [DONE]")
+                                        # IMPORTANT: RunPod OpenAI gateway expects SSE lines
+                                        yield "data: [DONE]\n\n"
+                                        break
+                                    try:
+                                        obj = json.loads(chunk)
+                                    except Exception:
+                                        continue
+                                    if self.debug:
+                                        print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+                                    # Yield SSE string, not a dict
+                                    yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
                             return
 
                         resp.raise_for_status()
                         async for line in resp.aiter_lines():
-                            if not line:
+                            if not line or not line.startswith("data: "):
                                 continue
-                            if line.startswith("data: "):
-                                chunk = line[len("data: "):].strip()
-                                if chunk == "[DONE]":
-                                    if self.debug:
-                                        print("[llama-debug] <- [DONE]")
-                                    break
-                                try:
-                                    obj = json.loads(chunk)
-                                    if self.debug:
-                                        print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
-                                    # NOTE: streaming yields raw OpenAI chunks (unchanged behavior)
-                                    yield obj
-                                except Exception:
-                                    pass
+                            chunk = line[len("data: "):].strip()
+                            if chunk == "[DONE]":
+                                if self.debug:
+                                    print("[llama-debug] <- [DONE]")
+                                yield "data: [DONE]\n\n"
+                                break
+                            try:
+                                obj = json.loads(chunk)
+                            except Exception:
+                                continue
+                            if self.debug:
+                                print(f"[llama-debug] <- chunk\n{json.dumps(obj, ensure_ascii=False, indent=2)}")
+                            # Yield SSE string, not a dict
+                            yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
             return _gen()
 
         # Non-streaming path
