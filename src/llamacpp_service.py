@@ -179,26 +179,112 @@ class LlamaCppService:
             "--port", str(self.port),
         ]
 
-        ngl = os.getenv("LLAMA_ARG_N_GPU_LAYERS") or os.getenv("N_GPU_LAYERS")
-        if ngl:
-            args += ["--n-gpu-layers", str(ngl)]
+        # Temperature (default 1.0)
+        temp = os.getenv("LLAMA_ARG_TEMP")
+        if temp:
+            args += ["--temp", str(temp)]
+        else:
+            args += ["--temp", "1.0"]
 
-        ts = os.getenv("LLAMA_ARG_TENSOR_SPLIT") or os.getenv("TENSOR_SPLIT")
-        if ts:
-            args += ["--tensor-split", ts]
+        # Min-p (default 0.0)
+        min_p = os.getenv("LLAMA_ARG_MIN_P")
+        if min_p:
+            args += ["--min-p", str(min_p)]
+        else:
+            args += ["--min-p", "0.0"]
 
-        sm = os.getenv("LLAMA_ARG_SPLIT_MODE")
-        if sm:
-            args += ["--split-mode", sm]
+        # Top-p (default 1.0)
+        top_p = os.getenv("LLAMA_ARG_TOP_P")
+        if top_p:
+            args += ["--top-p", str(top_p)]
+        else:
+            args += ["--top-p", "1.0"]
 
+        # Top-k (default 0)
+        top_k = os.getenv("LLAMA_ARG_TOP_K")
+        if top_k:
+            args += ["--top-k", str(top_k)]
+        else:
+            args += ["--top-k", "0"]
+
+        # Jinja templating
+        jinja = os.getenv("LLAMA_ARG_JINJA")
+        if jinja and jinja.lower() not in ("0", "false", "no", "n", ""):
+            args += ["--jinja"]
+        elif jinja is None:  # Default to enabled
+            args += ["--jinja"]
+
+        # Cache type K (single dash)
+        ctk = os.getenv("LLAMA_ARG_CTK")
+        if ctk:
+            args += ["-ctk", str(ctk)]
+        else:
+            args += ["-ctk", "q4_0"]
+
+        # Cache type V (single dash)
+        ctv = os.getenv("LLAMA_ARG_CTV")
+        if ctv:
+            args += ["-ctv", str(ctv)]
+        else:
+            args += ["-ctv", "q4_0"]
+
+        # Batch size for prompt processing
+        ub = os.getenv("LLAMA_ARG_UB")
+        if ub:
+            args += ["-ub", str(ub)]
+        else:
+            args += ["-ub", "2048"]
+
+        # Batch size
+        batch = os.getenv("LLAMA_ARG_BATCH")
+        if batch:
+            args += ["-b", str(batch)]
+        else:
+            args += ["-b", "2048"]
+
+        # Flash attention
+        fa = os.getenv("LLAMA_ARG_FA")
+        if fa and fa.lower() not in ("0", "false", "no", "n", ""):
+            args += ["-fa"]
+        elif fa is None:  # Default to enabled
+            args += ["-fa"]
+
+        # Context size (default 131072)
         n_ctx = os.getenv("LLAMA_ARG_N_CTX") or os.getenv("N_CTX")
         if n_ctx:
             args += ["--ctx-size", str(n_ctx)]
+        else:
+            args += ["--ctx-size", "131072"]
 
+        # GPU layers (default 999)
+        ngl = os.getenv("LLAMA_ARG_N_GPU_LAYERS") or os.getenv("N_GPU_LAYERS")
+        if ngl:
+            args += ["--n-gpu-layers", str(ngl)]
+        else:
+            args += ["--n-gpu-layers", "999"]
+
+        # Tensor split (default 0.5,0.5)
+        ts = os.getenv("LLAMA_ARG_TENSOR_SPLIT") or os.getenv("TENSOR_SPLIT")
+        if ts:
+            args += ["--tensor-split", ts]
+        else:
+            args += ["--tensor-split", "0.5,0.5"]
+
+        # Split mode (default layer)
+        sm = os.getenv("LLAMA_ARG_SPLIT_MODE")
+        if sm:
+            args += ["--split-mode", sm]
+        else:
+            args += ["--split-mode", "layer"]
+
+        # Parallel requests (default 8)
         n_par = os.getenv("LLAMA_ARG_N_PARALLEL")
         if n_par:
             args += ["--parallel", str(n_par)]
+        else:
+            args += ["--parallel", "8"]
 
+        # No webui
         if os.getenv("LLAMA_NO_WEBUI", "1") != "0":
             args += ["--no-webui"]
 
