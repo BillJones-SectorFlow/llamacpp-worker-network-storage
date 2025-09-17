@@ -209,7 +209,7 @@ class LlamaCppService:
             args += ["--top-k", "0"]
 
         # Jinja templating (flag only, no value)
-        jinja = os.getenv("LLAMA_ARG_JINJA", "1")
+        jinja = os.getenv("LLAMA_ARG_JINJA", "0")
         if jinja != "0":
             args += ["--jinja"]
 
