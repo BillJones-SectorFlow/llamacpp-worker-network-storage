@@ -179,112 +179,107 @@ class LlamaCppService:
             "--port", str(self.port),
         ]
 
-        # Temperature (default 1.0)
+        # Temperature
         temp = os.getenv("LLAMA_ARG_TEMP")
         if temp:
-            args += ["--temp", str(temp)]
-        else:
+            args += ["--temp", temp]
+        elif temp is None:  # Only add default if env var not set at all
             args += ["--temp", "1.0"]
 
-        # Min-p (default 0.0)
+        # Min-p
         min_p = os.getenv("LLAMA_ARG_MIN_P")
         if min_p:
-            args += ["--min-p", str(min_p)]
-        else:
+            args += ["--min-p", min_p]
+        elif min_p is None:
             args += ["--min-p", "0.0"]
 
-        # Top-p (default 1.0)
+        # Top-p  
         top_p = os.getenv("LLAMA_ARG_TOP_P")
         if top_p:
-            args += ["--top-p", str(top_p)]
-        else:
+            args += ["--top-p", top_p]
+        elif top_p is None:
             args += ["--top-p", "1.0"]
 
-        # Top-k (default 0)
+        # Top-k
         top_k = os.getenv("LLAMA_ARG_TOP_K")
         if top_k:
-            args += ["--top-k", str(top_k)]
-        else:
+            args += ["--top-k", top_k]
+        elif top_k is None:
             args += ["--top-k", "0"]
 
-        # Jinja templating
-        jinja = os.getenv("LLAMA_ARG_JINJA")
-        if jinja and jinja.lower() not in ("0", "false", "no", "n", ""):
-            args += ["--jinja"]
-        elif jinja is None:  # Default to enabled
+        # Jinja templating (flag only, no value)
+        jinja = os.getenv("LLAMA_ARG_JINJA", "1")
+        if jinja != "0":
             args += ["--jinja"]
 
         # Cache type K (single dash)
         ctk = os.getenv("LLAMA_ARG_CTK")
         if ctk:
-            args += ["-ctk", str(ctk)]
-        else:
+            args += ["-ctk", ctk]
+        elif ctk is None:
             args += ["-ctk", "q4_0"]
 
         # Cache type V (single dash)
         ctv = os.getenv("LLAMA_ARG_CTV")
         if ctv:
-            args += ["-ctv", str(ctv)]
-        else:
+            args += ["-ctv", ctv]
+        elif ctv is None:
             args += ["-ctv", "q4_0"]
 
         # Batch size for prompt processing
         ub = os.getenv("LLAMA_ARG_UB")
         if ub:
-            args += ["-ub", str(ub)]
-        else:
+            args += ["-ub", ub]
+        elif ub is None:
             args += ["-ub", "2048"]
 
         # Batch size
         batch = os.getenv("LLAMA_ARG_BATCH")
         if batch:
-            args += ["-b", str(batch)]
-        else:
+            args += ["-b", batch]
+        elif batch is None:
             args += ["-b", "2048"]
 
-        # Flash attention
-        fa = os.getenv("LLAMA_ARG_FA")
-        if fa and fa.lower() not in ("0", "false", "no", "n", ""):
-            args += ["-fa"]
-        elif fa is None:  # Default to enabled
+        # Flash attention (flag only)
+        fa = os.getenv("LLAMA_ARG_FA", "1")
+        if fa != "0":
             args += ["-fa"]
 
-        # Context size (default 131072)
-        n_ctx = os.getenv("LLAMA_ARG_N_CTX") or os.getenv("N_CTX")
-        if n_ctx:
-            args += ["--ctx-size", str(n_ctx)]
-        else:
-            args += ["--ctx-size", "131072"]
-
-        # GPU layers (default 999)
+        # GPU layers (already exists, just add default)
         ngl = os.getenv("LLAMA_ARG_N_GPU_LAYERS") or os.getenv("N_GPU_LAYERS")
         if ngl:
             args += ["--n-gpu-layers", str(ngl)]
         else:
             args += ["--n-gpu-layers", "999"]
 
-        # Tensor split (default 0.5,0.5)
+        # Tensor split (already exists, just add default)
         ts = os.getenv("LLAMA_ARG_TENSOR_SPLIT") or os.getenv("TENSOR_SPLIT")
         if ts:
             args += ["--tensor-split", ts]
         else:
             args += ["--tensor-split", "0.5,0.5"]
 
-        # Split mode (default layer)
+        # Split mode (already exists, just add default)
         sm = os.getenv("LLAMA_ARG_SPLIT_MODE")
         if sm:
             args += ["--split-mode", sm]
         else:
             args += ["--split-mode", "layer"]
 
-        # Parallel requests (default 8)
+        # Context size (already exists, just change default from not setting to 131072)
+        n_ctx = os.getenv("LLAMA_ARG_N_CTX") or os.getenv("N_CTX")
+        if n_ctx:
+            args += ["--ctx-size", str(n_ctx)]
+        else:
+            args += ["--ctx-size", "131072"]
+
+        # Parallel (already exists, just add default of 8)
         n_par = os.getenv("LLAMA_ARG_N_PARALLEL")
         if n_par:
             args += ["--parallel", str(n_par)]
         else:
             args += ["--parallel", "8"]
 
-        # No webui
         if os.getenv("LLAMA_NO_WEBUI", "1") != "0":
             args += ["--no-webui"]
 
