@@ -57,6 +57,7 @@ class LlamaCppService:
 
         # Start server and wait until ready
         self.proc: Optional[subprocess.Popen] = None
+        self.server_output_lines = []  # Store output for error reporting
         self._start_llama_server()
 
         self.max_concurrency = self._env_int("RUNPOD_MAX_CONCURRENCY", 1)
@@ -283,6 +284,9 @@ class LlamaCppService:
         if os.getenv("LLAMA_NO_WEBUI", "1") != "0":
             args += ["--no-webui"]
 
+        # Log the full command being executed
+        print(f"[llama-server] Starting with command: {' '.join(args)}")
+
         self.proc = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
@@ -292,8 +296,38 @@ class LlamaCppService:
             universal_newlines=True,
         )
 
+        # Start a thread to capture output
+        import threading
+        def capture_output():
+            if self.proc and self.proc.stdout:
+                for line in self.proc.stdout:
+                    line = line.strip()
+                    if line:
+                        self.server_output_lines.append(line)
+                        # Keep only last 100 lines to avoid memory issues
+                        if len(self.server_output_lines) > 100:
+                            self.server_output_lines.pop(0)
+                        # Print important error messages immediately
+                        if any(err in line.lower() for err in ['error', 'failed', 'exception', 'fatal']):
+                            print(f"[llama-server ERROR] {line}")
+
+        output_thread = threading.Thread(target=capture_output, daemon=True)
+        output_thread.start()
+
         # Wait for health to be truly ready with friendly countdown logging
-        self._wait_until_ready(self.ready_timeout)
+        try:
+            self._wait_until_ready(self.ready_timeout)
+        except Exception as e:
+            # Log the captured output on failure
+            print(f"[llama-server] FAILED to start: {e}")
+            if self.server_output_lines:
+                print("[llama-server] Last output from llama-server:")
+                for line in self.server_output_lines[-50:]:  # Last 50 lines
+                    print(f"  > {line}")
+            # Check if process died
+            if self.proc and self.proc.poll() is not None:
+                print(f"[llama-server] Process exited with code: {self.proc.returncode}")
+            raise
 
     def _wait_until_ready(self, timeout: int) -> None:
         start = time.time()
@@ -302,6 +336,18 @@ class LlamaCppService:
         required_ok = 3  # reduce 200->503 flapping
 
         while True:
+            # First check if the process died
+            if self.proc and self.proc.poll() is not None:
+                # Process exited, log the output
+                print(f"[llama-server] Process died with exit code: {self.proc.returncode}")
+                if self.server_output_lines:
+                    print("[llama-server] Output from llama-server:")
+                    for line in self.server_output_lines:
+                        print(f"  > {line}")
+                raise RuntimeError(
+                    f"llama-server process terminated unexpectedly with exit code {self.proc.returncode}"
+                )
+
             elapsed = time.time() - start
             remaining = int(max(0, timeout - elapsed))
 
@@ -326,6 +372,11 @@ class LlamaCppService:
                 consecutive_ok = 0
 
             if remaining <= 0:
+                # Log output before timing out
+                if self.server_output_lines:
+                    print("[llama-server] Recent output from llama-server:")
+                    for line in self.server_output_lines[-30:]:
+                        print(f"  > {line}")
                 raise RuntimeError(
                     f"llama-server failed to become ready within {timeout}s "
                     f"(last health status was not stable 200)."
