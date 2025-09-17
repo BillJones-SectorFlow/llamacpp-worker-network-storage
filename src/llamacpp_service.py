@@ -241,7 +241,12 @@ class LlamaCppService:
         elif batch is None:
             args += ["-b", "2048"]
 
-        args += ["--flash-attn"]
+        fa = os.getenv("LLAMA_ARG_FLASH_ATTN")
+
+        if fa:
+            args += ["--flash-attn", str(fa)]
+        elif fa is None:
+            args += ["--flash-attn", "auto"]
 
         # GPU layers (already exists, just add default)
         ngl = os.getenv("LLAMA_ARG_N_GPU_LAYERS") or os.getenv("N_GPU_LAYERS")
