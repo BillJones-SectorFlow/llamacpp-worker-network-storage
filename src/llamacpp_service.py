@@ -241,16 +241,7 @@ class LlamaCppService:
         elif batch is None:
             args += ["-b", "2048"]
 
-        # Flash attention - needs a value: on/off/auto
-        fa = os.getenv("LLAMA_ARG_FA", "auto")
-        if fa.lower() in ["on", "off", "auto"]:
-            args += ["-fa", fa.lower()]
-        elif fa == "1":
-            args += ["-fa", "on"]
-        elif fa == "0":
-            args += ["-fa", "off"]
-        else:
-            args += ["-fa", "auto"]
+        args += ["--fast-attention"]
 
         # GPU layers (already exists, just add default)
         ngl = os.getenv("LLAMA_ARG_N_GPU_LAYERS") or os.getenv("N_GPU_LAYERS")
