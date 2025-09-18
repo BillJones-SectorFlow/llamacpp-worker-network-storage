@@ -11,6 +11,7 @@ from typing import Any, AsyncGenerator, Dict, Optional, Union
 import httpx
 
 from model_fetcher import ModelFetcher
+from harmony_adapter import translate_chat_completion, translate_chat_chunk
 
 
 def _quiet_httpx_logs() -> None:
@@ -61,6 +62,10 @@ class LlamaCppService:
         self._start_llama_server()
 
         self.max_concurrency = self._env_int("RUNPOD_MAX_CONCURRENCY", 1)
+
+        # ---- Harmony translation controls (defaults ON) ----
+        self.harmony_translate = self._env_bool("HARMONY_TRANSLATE", True)
+        self.harmony_include_reasoning = self._env_bool("HARMONY_INCLUDE_REASONING", True)
 
     # ---------- OpenAI-compatible entry points ----------
     async def handle_openai_route(
@@ -125,16 +130,33 @@ class LlamaCppService:
                                 async for line in resp2.aiter_lines():
                                     if not line or not line.startswith("data: "):
                                         continue
-                                    # pass-through exactly as SSE; aiter_lines strips newlines -> add \n\n
+                                    # [DONE] passthrough
                                     if line == "data: [DONE]":
                                         if self.debug:
                                             print("[llama-debug] <- [DONE]")
                                         yield "data: [DONE]\n\n"
                                         break
+
+                                    out_line = line  # default: passthrough
+                                    # Harmony translation ONLY for chat.completions
+                                    if self.harmony_translate and path.endswith("/v1/chat/completions"):
+                                        raw = line[6:].strip()  # strip "data: "
+                                        try:
+                                            obj = json.loads(raw)
+                                            obj = translate_chat_chunk(
+                                                obj,
+                                                include_reasoning=self.harmony_include_reasoning,
+                                            )
+                                            out_line = "data: " + json.dumps(obj, ensure_ascii=False)  # translated
+                                        except Exception:
+                                            # On any parse/transform error, fall back to passthrough
+                                            out_line = line
+
                                     if self.debug:
-                                        # try to show the JSON chunk, but don't parse for speed
-                                        print(f"[llama-debug] <- chunk {line[6:][:200]}...")
-                                    yield line + "\n\n"
+                                        preview = out_line[6:][:200] if out_line.startswith("data: ") else out_line[:200]
+                                        print(f"[llama-debug] <- chunk {preview}...")
+                                    # pass-through exactly as SSE; aiter_lines strips newlines -> add \n\n
+                                    yield out_line + "\n\n"
                             return
 
                         resp.raise_for_status()
@@ -146,9 +168,25 @@ class LlamaCppService:
                                     print("[llama-debug] <- [DONE]")
                                 yield "data: [DONE]\n\n"
                                 break
+
+                            out_line = line  # default: passthrough
+                            # Harmony translation ONLY for chat.completions
+                            if self.harmony_translate and path.endswith("/v1/chat/completions"):
+                                raw = line[6:].strip()  # strip "data: "
+                                try:
+                                    obj = json.loads(raw)
+                                    obj = translate_chat_chunk(
+                                        obj,
+                                        include_reasoning=self.harmony_include_reasoning,
+                                    )
+                                    out_line = "data: " + json.dumps(obj, ensure_ascii=False)  # translated
+                                except Exception:
+                                    out_line = line
+
                             if self.debug:
-                                print(f"[llama-debug] <- chunk {line[6:][:200]}...")
-                            yield line + "\n\n"
+                                preview = out_line[6:][:200] if out_line.startswith("data: ") else out_line[:200]
+                                print(f"[llama-debug] <- chunk {preview}...")
+                            yield out_line + "\n\n"
             return _gen()
 
         # Non-streaming path
@@ -160,7 +198,17 @@ class LlamaCppService:
             r.raise_for_status()
             data = r.json()
 
-            # --- DEBUG: log response JSON ---
+            # Harmony translation ONLY for chat.completions
+            if self.harmony_translate and path.endswith("/v1/chat/completions") and isinstance(data, dict):
+                try:
+                    data = translate_chat_completion(
+                        data, include_reasoning=self.harmony_include_reasoning
+                    )
+                except Exception:
+                    # If translation fails, return original to avoid breaking clients
+                    pass
+
+            # --- DEBUG: log response JSON (after any translation so logs match output) ---
             if self.debug:
                 try:
                     print(f"[llama-debug] <- {r.status_code} {url}\n{json.dumps(data, ensure_ascii=False, indent=2)}")
