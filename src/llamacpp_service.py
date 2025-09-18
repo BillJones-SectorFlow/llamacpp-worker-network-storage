@@ -296,6 +296,10 @@ class LlamaCppService:
         elif fa is None:
             args += ["--flash-attn", "auto"]
 
+        chat_template = os.getenv("LLAMA_ARG_CHAT_TEMPLATE")
+        if chat_template:
+            args += ["--chat-template", chat_template]
+
         # GPU layers (already exists, just add default)
         ngl = os.getenv("LLAMA_ARG_N_GPU_LAYERS") or os.getenv("N_GPU_LAYERS")
         if ngl:
