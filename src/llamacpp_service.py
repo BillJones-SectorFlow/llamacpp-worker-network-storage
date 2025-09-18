@@ -279,15 +279,11 @@ class LlamaCppService:
         ub = os.getenv("LLAMA_ARG_UB")
         if ub:
             args += ["-ub", ub]
-        elif ub is None:
-            args += ["-ub", "2048"]
 
         # Batch size
         batch = os.getenv("LLAMA_ARG_BATCH")
         if batch:
             args += ["-b", batch]
-        elif batch is None:
-            args += ["-b", "2048"]
 
         fa = os.getenv("LLAMA_ARG_FLASH_ATTN")
 
@@ -311,8 +307,6 @@ class LlamaCppService:
         ts = os.getenv("LLAMA_ARG_TENSOR_SPLIT") or os.getenv("TENSOR_SPLIT")
         if ts:
             args += ["--tensor-split", ts]
-        else:
-            args += ["--tensor-split", "0.5,0.5"]
 
         # Split mode (already exists, just add default)
         sm = os.getenv("LLAMA_ARG_SPLIT_MODE")
@@ -332,8 +326,6 @@ class LlamaCppService:
         n_par = os.getenv("LLAMA_ARG_N_PARALLEL")
         if n_par:
             args += ["--parallel", str(n_par)]
-        else:
-            args += ["--parallel", "8"]
 
         if os.getenv("LLAMA_NO_WEBUI", "1") != "0":
             args += ["--no-webui"]
