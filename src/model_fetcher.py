@@ -35,7 +35,7 @@ class ModelFetcher:
 
         # Local cache root and subdir
         self.local_root = Path(os.getenv("MODEL_LOCAL_DIR", "") or self._default_local_root())
-        subdir = (os.getenv("MODEL_SUBDIR") or (self.prefix.rsplit("/", 1)[-1] if self.prefix else "model")).strip()
+        subdir = (os.getenv("MODEL_SUBDIR") or (self.prefix.rsplit("/", 1)[-1] if self.prefix else "")).strip()
         self.local_dir = self.local_root / subdir
         self.local_dir.mkdir(parents=True, exist_ok=True)
 
